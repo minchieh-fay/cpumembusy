@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -27,10 +28,17 @@ func init() {
 	}))
 }
 
+var (
+	peakUsageOrigin int          // 原始的 peakUsage 值
+	peakUsage       int          // 当前浮动的 peakUsage 值
+	peakUsageMu     sync.RWMutex // 保护 peakUsage 的读写锁
+)
+
 func main() {
 	// 读取环境变量
-	peakUsage := getPeakUsage()
-	logger.Info("程序启动", "peak_usage", peakUsage, "hard_peak_limit", hardPeakLimit)
+	peakUsageOrigin = getPeakUsage()
+	peakUsage = peakUsageOrigin
+	logger.Info("程序启动", "peak_usage_origin", peakUsageOrigin, "peak_usage", peakUsage, "hard_peak_limit", hardPeakLimit)
 
 	// 初始化系统资源监控
 	stats, err := GetSystemStats()
@@ -53,11 +61,15 @@ func main() {
 	//signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// 主循环
-	monitorTicker := time.NewTicker(50 * time.Millisecond)
+	monitorTicker := time.NewTicker(3 * time.Second)
 	defer monitorTicker.Stop()
 
 	gcTicker := time.NewTicker(1 * time.Minute)
 	defer gcTicker.Stop()
+
+	// 每 5 分钟更新一次 peakUsage
+	peakUsageTicker := time.NewTicker(5 * time.Minute)
+	defer peakUsageTicker.Stop()
 
 	lastStats := stats
 
@@ -72,6 +84,10 @@ func main() {
 			runtime.GC()
 			logger.Info("触发垃圾回收")
 
+		case <-peakUsageTicker.C:
+			// 每 5 分钟更新一次 peakUsage
+			updatePeakUsage()
+
 		case <-monitorTicker.C:
 			// 获取系统资源信息
 			currentStats, err := GetSystemStats()
@@ -82,8 +98,13 @@ func main() {
 				lastStats = currentStats
 			}
 
+			// 获取当前的 peakUsage（加读锁）
+			peakUsageMu.RLock()
+			currentPeakUsage := peakUsage
+			peakUsageMu.RUnlock()
+
 			// 计算期望占用值
-			expectedUsage := calculateExpectedUsage(peakUsage)
+			expectedUsage := calculateExpectedUsage(currentPeakUsage)
 			isNightTime := isNightTime()
 
 			// 打印资源监控信息
@@ -336,4 +357,36 @@ func formatPercent(p float64) string {
 // formatProbability 格式化概率，保留1位小数（0.0-1.0）
 func formatProbability(p float64) string {
 	return fmt.Sprintf("%.1f", p)
+}
+
+// updatePeakUsage 每 5 分钟更新一次 peakUsage
+// 新值范围：rand[0.2 * peakUsage_origin, peakUsage_origin]
+func updatePeakUsage() {
+	peakUsageMu.Lock()
+	defer peakUsageMu.Unlock()
+
+	// 保存旧值用于日志
+	oldPeakUsage := peakUsage
+
+	// 计算范围：0.2 * peakUsage_origin 到 peakUsage_origin
+	minValue := float64(peakUsageOrigin) * 0.2
+	maxValue := float64(peakUsageOrigin)
+
+	// 生成随机值
+	newValue := minValue + rand.Float64()*(maxValue-minValue)
+
+	// 转换为整数，并确保不小于最小值
+	peakUsage = int(newValue)
+	if peakUsage < int(minValue) {
+		peakUsage = int(minValue)
+	}
+	if peakUsage < minPeakUsage {
+		peakUsage = minPeakUsage
+	}
+
+	logger.Info("peakUsage 更新",
+		"peak_usage_origin", peakUsageOrigin,
+		"peak_usage_old", oldPeakUsage,
+		"peak_usage_new", peakUsage,
+		"range", fmt.Sprintf("[%.1f, %d]", minValue, peakUsageOrigin))
 }
